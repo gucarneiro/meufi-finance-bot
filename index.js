@@ -1,19 +1,46 @@
+// Polyfill para Object.hasOwn (compatibilidade com Node < 16)
+if (!Object.hasOwn) {
+  Object.hasOwn = function (obj, prop) {
+    return Object.prototype.hasOwnProperty.call(obj, prop);
+  };
+}
+
+// ==================== CONFIGURAÇÃO DE REDE (DNS IPv4 FIRST) ====================
+// Garante que o Node.js priorize IPv4 para evitar erros de ETIMEDOUT na Render ao acessar api.telegram.org
+const dns = require('dns');
+if (dns.setDefaultResultOrder) {
+  dns.setDefaultResultOrder('ipv4first');
+}
+
+require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const mongoose = require('mongoose');
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
+
+const bot = new Telegraf(process.env.BOT_TOKEN);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+app.use(express.json());
+
+// Rota raiz para manter o serviço ativo na Render
 app.get('/', (req, res) => {
-  res.send('🤖 Bot Financeiro MeuFi rodando com sucesso!');
+  res.status(200).send('🤖 Bot Financeiro MeuFi rodando com sucesso!');
 });
+
+// Endpoint de verificação de saúde para serviços de monitoramento (UptimeRobot, cron-job, etc.)
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', uptime: process.uptime(), timestamp: new Date() });
+});
+
+// Suporte a Webhook caso configurado
+app.use(bot.webhookCallback('/webhook'));
 
 app.listen(PORT, () => {
   console.log(`🌐 Servidor HTTP ativo na porta ${PORT}`);
 });
-const fs = require('fs');
-const path = require('path');
-require('dotenv').config();
 
 // ==================== 1. CONEXÃO COM O MONGODB ATLAS ====================
 const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI;
@@ -79,7 +106,6 @@ const UserSchema = new mongoose.Schema({
 const User = mongoose.model('User', UserSchema);
 
 // ==================== 3. CONFIGURAÇÕES E ESTADOS GERAIS ====================
-const bot = new Telegraf(process.env.BOT_TOKEN);
 const DB_FILE = path.join(__dirname, 'db.json');
 
 // Armazena o estado temporário de conversas interativas por usuário (chatId)
@@ -1359,12 +1385,37 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// ==================== INICIALIZAÇÃO DO BOT ====================
-bot.launch().then(() => {
-  console.log('🤖 Bot financeiro com MongoDB Atlas rodando!');
-}).catch(err => {
-  console.error('Erro ao iniciar o bot:', err);
-});
+// ==================== INICIALIZAÇÃO DO BOT (POLLING / WEBHOOK) ====================
+async function startBot() {
+  const isRender = !!process.env.RENDER_EXTERNAL_URL;
+  const useWebhook = process.env.USE_WEBHOOK === 'true' && isRender;
+
+  if (useWebhook) {
+    const webhookUrl = `${process.env.RENDER_EXTERNAL_URL}/webhook`;
+    try {
+      await bot.telegram.setWebhook(webhookUrl);
+      console.log(`🤖 Bot iniciado com sucesso via WEBHOOK em: ${webhookUrl}`);
+    } catch (err) {
+      console.error('❌ Erro ao configurar Webhook no Telegram:', err);
+    }
+  } else {
+    try {
+      // Remove webhooks legados se houver para evitar conflitos de getUpdates
+      await bot.telegram.deleteWebhook({ drop_pending_updates: false }).catch(() => {});
+      bot.launch().catch(err => {
+        console.error('❌ Erro no bot.launch (Long Polling):', err);
+        setTimeout(startBot, 5000);
+      });
+      console.log('🤖 Bot financeiro com MongoDB Atlas rodando via Long Polling!');
+    } catch (err) {
+      console.error('❌ Erro ao inicializar Long Polling:', err);
+      // Tentativa automática de reconexão após 5 segundos em caso de oscilação transitória de rede
+      setTimeout(startBot, 5000);
+    }
+  }
+}
+
+startBot();
 
 process.once('SIGINT', () => {
   mongoose.connection.close();
