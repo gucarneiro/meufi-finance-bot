@@ -1,0 +1,46 @@
+{
+  "usuarios": {
+    "1917341968": {
+      "transacoes": [
+        {
+          "id": 1794095668583,
+          "tipo": "gasto",
+          "valor": 150,
+          "categoria": "Despesa",
+          "descricao": "Sem descrição",
+          "data": "2026-11-07T23:54:28.583Z"
+        }
+      ],
+      "relatorioConfig": null,
+      "renda": 0,
+      "limiteGeral": 0,
+      "limitesCategorias": {
+        "Entreterimento": 50,
+        "Despesa": 200
+      },
+      "contasFixas": []
+    },
+    "7141517233": {
+      "transacoes": [],
+      "relatorioConfig": null,
+      "renda": 0,
+      "limiteGeral": 0,
+      "limitesCategorias": {},
+      "contasFixas": []
+    },
+    "9148055656": {
+      "transacoes": [],
+      "relatorioConfig": null,
+      "renda": 5000,
+      "limiteGeral": 0,
+      "limitesCategorias": {
+        "FastFood": 400,
+        "Contas de casa": 1000,
+        "Cartão de Credito": 500,
+        "Entreterimento": 100,
+        "Despesa": 400
+      },
+      "contasFixas": []
+    }
+  }
+}

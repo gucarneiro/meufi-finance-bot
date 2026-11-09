@@ -1,0 +1,14 @@
+{
+  "name": "chatbot-financeiro",
+  "version": "1.0.0",
+  "description": "Bot Organizador Financeiro no Telegram",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.9",
+    "mongoose": "^6.13.12",
+    "telegraf": "^4.16.3"
+  }
+}
