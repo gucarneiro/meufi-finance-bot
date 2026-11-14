@@ -98,12 +98,41 @@ const UserSchema = new mongoose.Schema({
   relatorioConfig: {
     type: mongoose.Schema.Types.Mixed,
     default: null
+  },
+  emAtendimentoHumano: {
+    type: Boolean,
+    default: false
+  },
+  ultimaAtividade: {
+    type: Date,
+    default: Date.now
   }
 }, {
   timestamps: true
 });
 
 const User = mongoose.model('User', UserSchema);
+
+// Schema de Configurações Gerais do Bot (fallback de persistência como ADMIN_GROUP_ID)
+const ConfigSchema = new mongoose.Schema({
+  chave: { type: String, required: true, unique: true },
+  valor: { type: mongoose.Schema.Types.Mixed }
+});
+
+const AppConfig = mongoose.model('AppConfig', ConfigSchema);
+
+async function getAdminGroupId() {
+  if (process.env.ADMIN_GROUP_ID && process.env.ADMIN_GROUP_ID.trim() !== '') {
+    return String(process.env.ADMIN_GROUP_ID).trim();
+  }
+  try {
+    const config = await AppConfig.findOne({ chave: 'ADMIN_GROUP_ID' });
+    if (config && config.valor) {
+      return String(config.valor).trim();
+    }
+  } catch (_) {}
+  return null;
+}
 
 // ==================== 3. CONFIGURAÇÕES E ESTADOS GERAIS ====================
 const DB_FILE = path.join(__dirname, 'db.json');
@@ -181,7 +210,9 @@ async function getUserProfile(chatId) {
       limitesCategorias: {},
       contasFixas: [],
       transacoes: [],
-      relatorioConfig: null
+      relatorioConfig: null,
+      emAtendimentoHumano: false,
+      ultimaAtividade: new Date()
     };
 
     // Migração automática de dados legados do db.json (caso existam)
@@ -209,6 +240,8 @@ async function getUserProfile(chatId) {
   if (!profile.contasFixas) profile.contasFixas = [];
   if (!profile.limitesCategorias) profile.limitesCategorias = {};
   if (!profile.transacoes) profile.transacoes = [];
+  if (typeof profile.emAtendimentoHumano === 'undefined') profile.emAtendimentoHumano = false;
+  if (!profile.ultimaAtividade) profile.ultimaAtividade = new Date();
 
   return profile;
 }
@@ -496,6 +529,8 @@ Basta me mandar uma mensagem com o *valor* e a *descrição* que eu categorizo a
 • /contasfixas - Cadastra e gerencia suas contas fixas do mês.
 • /extrato - Visualiza o extrato de gastos por período.
 • /relatorio - Gerencia automações e relatórios periódicos.
+• /atendente - Solicita suporte para falar com atendente humano.
+• /encerrar - Encerra o atendimento humano em andamento.
 • /limpar - Zera todo o seu histórico.
 • /ajuda ou /help - Exibe este guia.`;
 
@@ -535,21 +570,29 @@ bot.command('help', enviarAjuda);
 bot.help(enviarAjuda);
 
 // ==================== FUNÇÃO DO MENU PRINCIPAL ====================
-async function enviarMenuPrincipal(ctx, editMode = false) {
+async function enviarMenuPrincipal(target, editMode = false) {
   const menuBotoes = Markup.inlineKeyboard([
     [Markup.button.callback('💵 Cadastrar / Ver Renda', 'menu_renda')],
     [Markup.button.callback('🎯 Gerenciar Limites', 'menu_limite')],
     [Markup.button.callback('📌 Contas Fixas', 'menu_contas')],
     [Markup.button.callback('📊 Extrato', 'menu_extrato'), Markup.button.callback('📈 Relatórios', 'menu_relatorio')],
+    [Markup.button.callback('💬 Falar com Atendente', 'menu_atendente')],
     [Markup.button.callback('🗑️ Limpar Histórico', 'menu_limpar'), Markup.button.callback('❓ Ajuda', 'menu_ajuda')]
   ]);
 
   const textoMensagem = '🤖 *Organizador Financeiro - Menu Principal*\n\nEscolha uma opção abaixo:';
 
+  if (typeof target === 'string' || typeof target === 'number') {
+    return bot.telegram.sendMessage(target, formatarMarkdown(textoMensagem), {
+      parse_mode: 'Markdown',
+      ...menuBotoes
+    }).catch(err => console.error('Erro ao enviar menu principal por chatId:', err.message));
+  }
+
   if (editMode) {
-    return editMD(ctx, textoMensagem, menuBotoes);
+    return editMD(target, textoMensagem, menuBotoes);
   } else {
-    return replyMD(ctx, textoMensagem, menuBotoes);
+    return replyMD(target, textoMensagem, menuBotoes);
   }
 }
 
@@ -672,6 +715,8 @@ bot.action('menu_limpar', async (ctx) => {
     profile.markModified('limitesCategorias');
     profile.contasFixas = [];
     profile.markModified('contasFixas');
+    profile.emAtendimentoHumano = false;
+    profile.ultimaAtividade = new Date();
     await profile.save();
 
     const menuVoltar = Markup.inlineKeyboard([[Markup.button.callback('🔙 Voltar ao Menu', 'menu_voltar')]]);
@@ -749,6 +794,8 @@ bot.command('limpar', async (ctx) => {
     profile.markModified('limitesCategorias');
     profile.contasFixas = [];
     profile.markModified('contasFixas');
+    profile.emAtendimentoHumano = false;
+    profile.ultimaAtividade = new Date();
     await profile.save();
 
     const menuVoltar = Markup.inlineKeyboard([[Markup.button.callback('🔙 Voltar ao Menu', 'menu_voltar')]]);
@@ -1293,11 +1340,380 @@ bot.action('rel_forcar', async (ctx) => {
   }
 });
 
+// ==================== 4. ATENDIMENTO HUMANO (HUMAN HANDOVER) ====================
+const adminMessageMap = new Map();
+const TIMEOUT_INATIVIDADE_MS = 5 * 60 * 1000; // 5 minutos
+
+function extrairChatIdDeMensagem(msg) {
+  if (!msg) return null;
+  if (adminMessageMap.has(msg.message_id)) {
+    return adminMessageMap.get(msg.message_id);
+  }
+  const texto = msg.text || msg.caption || '';
+  const match = texto.match(/#ID_(\d+)/) || texto.match(/ID:\s*`?(\d+)`?/i);
+  if (match) {
+    return match[1];
+  }
+  return null;
+}
+
+const iniciarAtendimentoHumano = async (ctx) => {
+  try {
+    await ctx.answerCbQuery().catch(() => {});
+    const chatId = String(ctx.chat.id);
+    const profile = await getUserProfile(chatId);
+
+    profile.emAtendimentoHumano = true;
+    profile.ultimaAtividade = new Date();
+    await profile.save();
+    delete userStates[chatId];
+
+    // Envia a mensagem padrão ao usuário
+    await replyMD(
+      ctx,
+      '💬 *O atendente vai entrar no chat em alguns instantes.*\n\n' +
+      'Você já pode escrever sua dúvida ou mensagem por aqui.'
+    );
+
+    // Notifica o grupo de atendimento (ADMIN_GROUP_ID)
+    const adminGroupId = await getAdminGroupId();
+    if (adminGroupId) {
+      const nome = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ');
+      const username = ctx.from.username ? `@${ctx.from.username}` : 'sem username';
+      const msgAdmin = 
+        `🔔 *NOVA SOLICITAÇÃO DE SUPORTE*\n\n` +
+        `👤 *Usuário:* ${nome} (${username})\n` +
+        `🆔 *Chat ID:* \`${chatId}\`\n\n` +
+        `💬 _Responda (Reply) a esta mensagem para falar diretamente com o usuário._\n` +
+        `#ID_${chatId}`;
+
+      try {
+        const sent = await bot.telegram.sendMessage(adminGroupId, msgAdmin, { parse_mode: 'Markdown' });
+        adminMessageMap.set(sent.message_id, chatId);
+      } catch (errAdmin) {
+        console.error('❌ Erro ao enviar notificação para ADMIN_GROUP_ID:', errAdmin.message);
+      }
+    } else {
+      console.warn('⚠️ ADMIN_GROUP_ID não configurado! Notificação de suporte não pôde ser enviada.');
+    }
+  } catch (err) {
+    console.error('Erro no iniciarAtendimentoHumano:', err);
+  }
+};
+
+async function fecharAtendimento(ctx, targetChatId, iniciadoPor = 'admin') {
+  try {
+    const profile = await getUserProfile(targetChatId);
+    profile.emAtendimentoHumano = false;
+    profile.ultimaAtividade = new Date();
+    await profile.save();
+
+    // Avisa o usuário que o atendimento foi encerrado e exibe o menu inicial
+    try {
+      await bot.telegram.sendMessage(
+        targetChatId,
+        '👋 *Atendimento encerrado.*\n\nObrigado pelo contato! Se precisar de algo mais, utilize o menu abaixo:',
+        { parse_mode: 'Markdown' }
+      );
+      await enviarMenuPrincipal(targetChatId, false);
+    } catch (errUser) {
+      console.error(`Erro ao avisar usuário ${targetChatId} sobre fechamento:`, errUser.message);
+    }
+
+    // Se foi fechado pelo admin no grupo, envia confirmação no grupo
+    const adminGroupId = await getAdminGroupId();
+    if (adminGroupId) {
+      const msgStatus = iniciadoPor === 'admin'
+        ? `✅ *Atendimento com o usuário (ID: \`${targetChatId}\`) foi encerrado pelo atendente.*`
+        : `ℹ️ *O usuário (ID: \`${targetChatId}\`) encerrou o atendimento.*`;
+
+      try {
+        await bot.telegram.sendMessage(adminGroupId, msgStatus, { parse_mode: 'Markdown' });
+      } catch (errAdmin) {
+        console.error('Erro ao confirmar fechamento no grupo:', errAdmin.message);
+      }
+    }
+  } catch (err) {
+    console.error('Erro em fecharAtendimento:', err);
+  }
+}
+
+// Timeout de Inatividade (5 minutos)
+async function verificarTimeoutAtendimentos() {
+  try {
+    const agora = Date.now();
+    const limiteInatividade = new Date(agora - TIMEOUT_INATIVIDADE_MS);
+
+    const usuariosExpirados = await User.find({
+      emAtendimentoHumano: true,
+      ultimaAtividade: { $lt: limiteInatividade }
+    });
+
+    for (const usuario of usuariosExpirados) {
+      usuario.emAtendimentoHumano = false;
+      usuario.ultimaAtividade = new Date();
+      await usuario.save();
+
+      console.log(`⌛ Atendimento do usuário ${usuario.chatId} encerrado por inatividade (5 min).`);
+
+      try {
+        await bot.telegram.sendMessage(
+          usuario.chatId,
+          '⌛ *Atendimento encerrado por inatividade (5 minutos sem novas mensagens).*\n\nSe ainda precisar de suporte, você pode chamar novamente pelo menu:',
+          { parse_mode: 'Markdown' }
+        );
+        await enviarMenuPrincipal(usuario.chatId, false);
+      } catch (errUser) {
+        console.error(`Erro ao avisar usuário ${usuario.chatId} sobre timeout:`, errUser.message);
+      }
+
+      const adminGroupId = await getAdminGroupId();
+      if (adminGroupId) {
+        try {
+          await bot.telegram.sendMessage(
+            adminGroupId,
+            `⌛ *Atendimento Encerrado por Inatividade*\n\nO atendimento com o usuário (ID: \`${usuario.chatId}\`) foi finalizado automaticamente após 5 minutos sem interação.`,
+            { parse_mode: 'Markdown' }
+          );
+        } catch (errAdmin) {
+          console.error('Erro ao avisar grupo sobre timeout:', errAdmin.message);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Erro na verificação de timeout de atendimento:', err);
+  }
+}
+
+// Verifica timeouts a cada 30 segundos
+setInterval(verificarTimeoutAtendimentos, 30000);
+
+bot.action('menu_atendente', iniciarAtendimentoHumano);
+bot.command('atendente', iniciarAtendimentoHumano);
+
+// Comando de Fechamento (/fechar)
+bot.command('fechar', async (ctx) => {
+  const chatId = String(ctx.chat.id);
+  const adminGroupId = await getAdminGroupId();
+
+  if (adminGroupId && chatId === String(adminGroupId)) {
+    if (ctx.message.reply_to_message) {
+      const targetChatId = extrairChatIdDeMensagem(ctx.message.reply_to_message);
+      if (targetChatId) {
+        return fecharAtendimento(ctx, targetChatId, 'admin');
+      }
+    }
+    const partes = (ctx.message.text || '').trim().split(/\s+/);
+    if (partes.length >= 2) {
+      const targetChatId = partes[1].replace(/\D/g, '');
+      if (targetChatId) {
+        return fecharAtendimento(ctx, targetChatId, 'admin');
+      }
+    }
+    return ctx.reply('⚠️ Responda à mensagem do usuário com `/fechar` ou use `/fechar <ID_DO_USUARIO>`.', { parse_mode: 'Markdown' });
+  } else {
+    const profile = await getUserProfile(chatId);
+    if (profile.emAtendimentoHumano) {
+      return fecharAtendimento(ctx, chatId, 'usuario');
+    }
+  }
+});
+
+bot.command(['encerrar', 'sair'], async (ctx) => {
+  const chatId = String(ctx.chat.id);
+  const profile = await getUserProfile(chatId);
+  if (profile.emAtendimentoHumano) {
+    return fecharAtendimento(ctx, chatId, 'usuario');
+  }
+});
+
+// Comandos para identificação e definição do Grupo de Atendimento
+bot.command(['id', 'chatid', 'grupo'], async (ctx) => {
+  if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
+    return ctx.reply(
+      `🆔 *ID deste Grupo:* \`${ctx.chat.id}\`\n\n` +
+      `Para ativar este grupo como o canal oficial de atendimento:\n` +
+      `1. Digite \`/definir_grupo\` aqui no grupo\n` +
+      `2. Ou adicione no seu .env: \`ADMIN_GROUP_ID=${ctx.chat.id}\``,
+      { parse_mode: 'Markdown' }
+    );
+  } else {
+    return ctx.reply(`🆔 Seu Chat ID pessoal é: \`${ctx.chat.id}\``, { parse_mode: 'Markdown' });
+  }
+});
+
+bot.command(['definir_grupo', 'setgrupo'], async (ctx) => {
+  if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
+    const groupId = String(ctx.chat.id);
+    await AppConfig.findOneAndUpdate(
+      { chave: 'ADMIN_GROUP_ID' },
+      { valor: groupId },
+      { upsert: true, new: true }
+    );
+    return ctx.reply(
+      `✅ *Grupo configurado com sucesso como Grupo de Atendimento!*\n\n` +
+      `🆔 *ID do Grupo:* \`${groupId}\`\n\n` +
+      `📌 O bot agora enviará os chamados para cá e você poderá responder aos usuários diretamente usando Reply.\n` +
+      `_(Para persistir no Render permanentemente, adicione a variável de ambiente: \`ADMIN_GROUP_ID=${groupId}\`)_`,
+      { parse_mode: 'Markdown' }
+    );
+  } else {
+    return ctx.reply('⚠️ Este comando deve ser executado dentro do grupo de atendimento no Telegram.');
+  }
+});
+
+bot.on('new_chat_members', async (ctx) => {
+  try {
+    const isBotAdded = ctx.message.new_chat_members.some(m => m.id === ctx.botInfo.id);
+    if (isBotAdded) {
+      console.log(`🎉 Bot adicionado ao grupo "${ctx.chat.title}" com ID: ${ctx.chat.id}`);
+      await ctx.reply(
+        `👋 *Olá! Sou o bot MeuFi.*\n\n` +
+        `Fui adicionado com sucesso a este grupo de suporte!\n` +
+        `🆔 *ID deste Grupo:* \`${ctx.chat.id}\`\n\n` +
+        `Para ativar o suporte neste grupo agora mesmo, digite:\n\`/definir_grupo\`\n\n` +
+        `Ou adicione no .env da Render: \`ADMIN_GROUP_ID=${ctx.chat.id}\``,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    }
+  } catch (err) {
+    console.error('Erro no new_chat_members:', err);
+  }
+});
+
+// Relé de mídias (fotos, documentos, áudios, etc.) durante o atendimento humano
+bot.on(['photo', 'document', 'voice', 'audio', 'video'], async (ctx) => {
+  try {
+    const chatId = String(ctx.chat.id);
+    const adminGroupId = await getAdminGroupId();
+
+    // Atendente respondeu com mídia no grupo
+    if (adminGroupId && chatId === String(adminGroupId)) {
+      if (ctx.message.reply_to_message) {
+        const targetChatId = extrairChatIdDeMensagem(ctx.message.reply_to_message);
+        if (targetChatId) {
+          await ctx.copyMessage(targetChatId).catch(() => {});
+          const targetProfile = await getUserProfile(targetChatId);
+          targetProfile.ultimaAtividade = new Date();
+          await targetProfile.save();
+        }
+      }
+      return;
+    }
+
+    // Usuário enviou mídia em atendimento humano
+    const profile = await getUserProfile(chatId);
+    if (profile.emAtendimentoHumano) {
+      profile.ultimaAtividade = new Date();
+      await profile.save();
+
+      if (adminGroupId) {
+        const nome = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ');
+        const infoMsg = await bot.telegram.sendMessage(adminGroupId, `📎 *Mídia enviada por ${nome}* [#ID_${chatId}]:`, { parse_mode: 'Markdown' });
+        adminMessageMap.set(infoMsg.message_id, chatId);
+        const copied = await ctx.copyMessage(adminGroupId).catch(() => {});
+        if (copied && copied.message_id) {
+          adminMessageMap.set(copied.message_id, chatId);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Erro no processador de mídias:', err);
+  }
+});
+
 // ==================== PROCESSADOR DE MENSAGENS E ESTADOS ====================
 bot.on('text', async (ctx) => {
   try {
     const texto = ctx.message.text;
-    const chatId = ctx.chat.id;
+    const chatId = String(ctx.chat.id);
+    const adminGroupId = await getAdminGroupId();
+
+    // 1. Mensagem vinda do Grupo de Atendimento (ADMIN_GROUP_ID)
+    if (adminGroupId && chatId === String(adminGroupId)) {
+      // Se for uma resposta (Reply) na mensagem repassada do usuário
+      if (ctx.message.reply_to_message) {
+        const targetChatId = extrairChatIdDeMensagem(ctx.message.reply_to_message);
+        if (targetChatId) {
+          if (texto.trim().toLowerCase().startsWith('/fechar')) {
+            return fecharAtendimento(ctx, targetChatId, 'admin');
+          }
+
+          const targetProfile = await getUserProfile(targetChatId);
+          targetProfile.ultimaAtividade = new Date();
+          await targetProfile.save();
+
+          try {
+            await bot.telegram.sendMessage(
+              targetChatId,
+              `👨‍💼 *Atendente:*\n${texto}`,
+              { parse_mode: 'Markdown' }
+            );
+          } catch (errEnvio) {
+            console.error(`Erro ao entregar mensagem do atendente para ${targetChatId}:`, errEnvio.message);
+            await ctx.reply(`⚠️ Não foi possível entregar a mensagem para o usuário (\`${targetChatId}\`). Ele pode ter bloqueado o bot.`, { parse_mode: 'Markdown' }).catch(() => {});
+          }
+          return;
+        }
+      }
+
+      // Se for /fechar com ID direto no grupo (Ex: /fechar 123456789)
+      if (texto.trim().toLowerCase().startsWith('/fechar')) {
+        const partes = texto.trim().split(/\s+/);
+        if (partes.length >= 2) {
+          const targetChatId = partes[1].replace(/\D/g, '');
+          if (targetChatId) {
+            return fecharAtendimento(ctx, targetChatId, 'admin');
+          }
+        }
+        return ctx.reply('⚠️ Para fechar o atendimento, responda à mensagem do usuário com `/fechar` ou digite `/fechar <ID_DO_USUARIO>`.', { parse_mode: 'Markdown' });
+      }
+
+      // Outras mensagens normais no grupo de suporte são ignoradas pelo bot
+      return;
+    }
+
+    // 2. Comandos utilitários de ID em outros grupos
+    if (texto.startsWith('/id') || texto.startsWith('/chatid') || texto.startsWith('/grupo')) {
+      if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
+        return ctx.reply(
+          `🆔 *ID deste Grupo:* \`${ctx.chat.id}\`\n\n` +
+          `Para vincular este grupo ao suporte:\n` +
+          `1. Digite \`/definir_grupo\` aqui\n` +
+          `2. Ou configure no .env: \`ADMIN_GROUP_ID=${ctx.chat.id}\``,
+          { parse_mode: 'Markdown' }
+        );
+      }
+    }
+
+    // 3. Verificação de Atendimento Humano para Usuário Privado
+    const profile = await getUserProfile(chatId);
+
+    if (profile.emAtendimentoHumano) {
+      if (texto.trim().toLowerCase() === '/encerrar' || texto.trim().toLowerCase() === '/sair' || texto.trim().toLowerCase() === '/fechar') {
+        return fecharAtendimento(ctx, chatId, 'usuario');
+      }
+
+      profile.ultimaAtividade = new Date();
+      await profile.save();
+
+      if (adminGroupId) {
+        const nome = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ');
+        const msgAdmin = `👤 *${nome}* [#ID_${chatId}]:\n\n${texto}`;
+
+        try {
+          const sent = await bot.telegram.sendMessage(adminGroupId, msgAdmin, { parse_mode: 'Markdown' });
+          adminMessageMap.set(sent.message_id, chatId);
+        } catch (errAdmin) {
+          console.error('❌ Erro ao repassar mensagem ao grupo de suporte:', errAdmin.message);
+        }
+      } else {
+        console.warn('⚠️ ADMIN_GROUP_ID não definido. Mensagem do usuário retida.');
+      }
+
+      // Interrompe o fluxo para não registrar gastos durante suporte
+      return;
+    }
 
     // Ignora comandos que começam com barra (já tratados individualmente pelos bot.command)
     if (texto.startsWith('/')) return;
@@ -1449,8 +1865,6 @@ bot.on('text', async (ctx) => {
     const valor = parseFloat(valorStr);
     const descricao = texto.replace(match[0], '').trim() || 'Sem descrição';
     const { categoria, tipo } = categorizarMensagem(descricao);
-
-    const profile = await getUserProfile(chatId);
 
     const novaTransacao = {
       id: Date.now(),
