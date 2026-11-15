@@ -123,15 +123,20 @@ const AppConfig = mongoose.model('AppConfig', ConfigSchema);
 
 async function getAdminGroupId() {
   if (process.env.ADMIN_GROUP_ID && process.env.ADMIN_GROUP_ID.trim() !== '') {
-    return String(process.env.ADMIN_GROUP_ID).trim();
+    return String(process.env.ADMIN_GROUP_ID).trim().replace(/['"]/g, '');
   }
   try {
     const config = await AppConfig.findOne({ chave: 'ADMIN_GROUP_ID' });
     if (config && config.valor) {
-      return String(config.valor).trim();
+      return String(config.valor).trim().replace(/['"]/g, '');
     }
   } catch (_) {}
   return null;
+}
+
+function isSameChat(chatId1, chatId2) {
+  if (!chatId1 || !chatId2) return false;
+  return String(chatId1).trim().replace(/['"]/g, '') === String(chatId2).trim().replace(/['"]/g, '');
 }
 
 // ==================== 3. CONFIGURAÇÕES E ESTADOS GERAIS ====================
@@ -425,11 +430,15 @@ function verificarAlertasDeLimite(userProfile, categoriaLancamento) {
 
 // Gera o Relatório e Extrato Formatado
 function gerarRelatorioFormatado(userProfile, transacoesFiltradas, tituloPeriodo) {
+  const SEPARADOR = '----------------------------------------';
   let totalGastosLancamentos = 0;
   let totalInvestimentos = 0;
   const gastosPorCategoria = {};
 
-  transacoesFiltradas.forEach(t => {
+  // Ordena transações da mais recente para a mais antiga
+  const transacoesOrdenadas = [...transacoesFiltradas].sort((a, b) => new Date(b.data) - new Date(a.data));
+
+  transacoesOrdenadas.forEach(t => {
     if (t.tipo === 'gasto') {
       totalGastosLancamentos += t.valor;
       gastosPorCategoria[t.categoria] = (gastosPorCategoria[t.categoria] || 0) + t.valor;
@@ -441,27 +450,54 @@ function gerarRelatorioFormatado(userProfile, transacoesFiltradas, tituloPeriodo
   const totalContasFixas = obterTotalContasFixas(userProfile);
   const totalGastosGeral = totalGastosLancamentos + totalContasFixas;
 
-  let resposta = `📊 *Relatório / Extrato (${tituloPeriodo})*\n\n`;
+  let resposta = `📊 *EXTRATO / RELATÓRIO FINANCEIRO*\n`;
+  resposta += `🗓️ *Período:* ${tituloPeriodo}\n`;
+  resposta += `${SEPARADOR}\n`;
 
-  if (totalGastosGeral > 0) {
-    resposta += `🔴 *Total de Gastos (Variáveis):* R$ ${totalGastosLancamentos.toFixed(2)}\n`;
-    if (totalContasFixas > 0) {
-      resposta += `📌 *Contas Fixas:* R$ ${totalContasFixas.toFixed(2)}\n`;
-      if (userProfile.contasFixas && userProfile.contasFixas.length > 0) {
-        userProfile.contasFixas.forEach(c => {
-          resposta += `   • ${c.nome}: R$ ${c.valor.toFixed(2)} (${c.categoria})\n`;
-        });
-      }
+  // 1. Resumo Geral de Gastos
+  resposta += `💰 *RESUMO GERAL DOS GASTOS*\n`;
+  resposta += `• 🔴 Gastos Variáveis: *R$ ${totalGastosLancamentos.toFixed(2)}*\n`;
+  if (totalContasFixas > 0) {
+    resposta += `• 📌 Contas Fixas: *R$ ${totalContasFixas.toFixed(2)}*\n`;
+  }
+  resposta += `📉 *Total Consolidado de Gastos:* *R$ ${totalGastosGeral.toFixed(2)}*\n`;
+
+  if (totalInvestimentos > 0) {
+    resposta += `• 🟢 Total Guardado / Investido: *R$ ${totalInvestimentos.toFixed(2)}*\n`;
+  }
+  resposta += `${SEPARADOR}\n`;
+
+  // 2. Detalhamento dos Lançamentos no Período
+  resposta += `📝 *LANÇAMENTOS DO PERÍODO*\n`;
+  if (transacoesOrdenadas.length === 0) {
+    resposta += `_(Nenhum lançamento registrado neste período)_\n`;
+  } else {
+    const limiteExibicao = 8;
+    const exibidas = transacoesOrdenadas.slice(0, limiteExibicao);
+
+    exibidas.forEach(t => {
+      const d = new Date(t.data);
+      const dia = String(d.getDate()).padStart(2, '0');
+      const mes = String(d.getMonth() + 1).padStart(2, '0');
+      const icone = t.tipo === 'investimento' ? '🟢' : '🔴';
+      resposta += `• ${icone} ${dia}/${mes} - ${t.descricao}: *R$ ${t.valor.toFixed(2)}* _(${t.categoria})_\n`;
+    });
+
+    if (transacoesOrdenadas.length > limiteExibicao) {
+      resposta += `_... e mais ${transacoesOrdenadas.length - limiteExibicao} lançamentos no período._\n`;
     }
-    resposta += `📉 *GASTO TOTAL CONSOLIDADO:* R$ ${totalGastosGeral.toFixed(2)}\n\n`;
+  }
+  resposta += `${SEPARADOR}\n`;
 
-    resposta += `📁 *Resumo por Categoria (Gastos Variáveis):*\n`;
+  // 3. Gastos por Categoria
+  if (totalGastosLancamentos > 0) {
+    resposta += `📁 *GASTOS POR CATEGORIA (VARIÁVEIS)*\n`;
     let maiorCategoria = '';
     let maiorValor = -1;
 
     for (const [categoria, valor] of Object.entries(gastosPorCategoria)) {
-      const porcentagem = totalGastosLancamentos > 0 ? ((valor / totalGastosLancamentos) * 100).toFixed(1) : '0.0';
-      resposta += `• _${categoria}_: R$ ${valor.toFixed(2)} (${porcentagem}%)\n`;
+      const porcentagem = ((valor / totalGastosLancamentos) * 100).toFixed(1);
+      resposta += `• _${categoria}_: *R$ ${valor.toFixed(2)}* (${porcentagem}%)\n`;
 
       if (valor > maiorValor) {
         maiorValor = valor;
@@ -470,41 +506,50 @@ function gerarRelatorioFormatado(userProfile, transacoesFiltradas, tituloPeriodo
     }
 
     if (maiorCategoria) {
-      resposta += `\n💡 *Destaque:* Seu maior gasto variável foi em *${maiorCategoria}* (R$ ${maiorValor.toFixed(2)}).\n`;
+      resposta += `\n💡 *Destaque:* Maior despesa em *${maiorCategoria}* (R$ ${maiorValor.toFixed(2)})\n`;
     }
-  } else {
-    resposta += `🔴 *Total de Gastos:* R$ 0.00\n`;
+    resposta += `${SEPARADOR}\n`;
   }
 
-  if (totalInvestimentos > 0) {
-    resposta += `\n🟢 *Total Investido/Guardado:* R$ ${totalInvestimentos.toFixed(2)}\n`;
+  // 4. Contas Fixas Cadastradas
+  if (userProfile.contasFixas && userProfile.contasFixas.length > 0) {
+    resposta += `📌 *CONTAS FIXAS DO MÊS*\n`;
+    userProfile.contasFixas.forEach(c => {
+      resposta += `• ${c.nome}: *R$ ${c.valor.toFixed(2)}* _(${c.categoria})_\n`;
+    });
+    resposta += `💰 *Subtotal Fixas:* *R$ ${totalContasFixas.toFixed(2)}*\n`;
+    resposta += `${SEPARADOR}\n`;
   }
 
-  // Cálculo da Renda Mensal
+  // 5. Balanço de Renda Mensal
   if (userProfile.renda > 0) {
-    resposta += `\n💵 *Cálculo da Renda Mensal:*\n`;
-    resposta += `• Renda Cadastrada: R$ ${userProfile.renda.toFixed(2)}\n`;
+    resposta += `💵 *BALANÇO DA RENDA MENSAL*\n`;
+    resposta += `• Renda Cadastrada: *R$ ${userProfile.renda.toFixed(2)}*\n`;
+    resposta += `• Total de Gastos: *R$ ${totalGastosGeral.toFixed(2)}*\n`;
     const saldoRenda = userProfile.renda - totalGastosGeral;
 
     if (saldoRenda >= 0) {
-      resposta += `✅ *Saldo Restante da Renda:* R$ ${saldoRenda.toFixed(2)}\n`;
+      resposta += `✅ *Saldo Restante da Renda:* *R$ ${saldoRenda.toFixed(2)}*\n`;
     } else {
       resposta += `🚨 *ALERTA:* Você ultrapassou sua renda em *R$ ${Math.abs(saldoRenda).toFixed(2)}*!\n`;
     }
+    resposta += `${SEPARADOR}\n`;
   }
 
-  // Status do Limite Geral
+  // 6. Status do Limite Mensal
   if (userProfile.limiteGeral > 0) {
-    resposta += `\n🎯 *Status do Limite Geral:*\n`;
-    resposta += `• Limite Definido: R$ ${userProfile.limiteGeral.toFixed(2)}\n`;
+    resposta += `🎯 *STATUS DO LIMITE MENSAL*\n`;
+    resposta += `• Limite Geral: *R$ ${userProfile.limiteGeral.toFixed(2)}*\n`;
+    resposta += `• Total Consumido: *R$ ${totalGastosGeral.toFixed(2)}*\n`;
     const saldoLimite = userProfile.limiteGeral - totalGastosGeral;
 
     if (saldoLimite >= 0) {
       const perc = ((saldoLimite / userProfile.limiteGeral) * 100).toFixed(1);
-      resposta += `🔹 Restam R$ ${saldoLimite.toFixed(2)} (${perc}% do limite geral)\n`;
+      resposta += `🔹 *Restam:* *R$ ${saldoLimite.toFixed(2)}* (${perc}% disponível)\n`;
     } else {
-      resposta += `⚠️ Ultrapassou o limite geral em R$ ${Math.abs(saldoLimite).toFixed(2)}\n`;
+      resposta += `⚠️ *Ultrapassou o limite em R$ ${Math.abs(saldoLimite).toFixed(2)}*!\n`;
     }
+    resposta += `${SEPARADOR}\n`;
   }
 
   return resposta;
@@ -622,9 +667,12 @@ bot.action('menu_limite', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     const chatId = ctx.chat.id;
     const profile = await getUserProfile(chatId);
+    const SEPARADOR = '----------------------------------------';
 
-    let textoResumo = `🎯 *Painel de Limites de Gastos*\n\n`;
-    textoResumo += `• *Limite Geral Mensal:* ${profile.limiteGeral > 0 ? `R$ ${profile.limiteGeral.toFixed(2)}` : 'Não definido'}\n\n`;
+    let textoResumo = `🎯 *PAINEL DE LIMITES DE GASTOS*\n`;
+    textoResumo += `${SEPARADOR}\n`;
+    textoResumo += `• *Limite Geral Mensal:* ${profile.limiteGeral > 0 ? `R$ ${profile.limiteGeral.toFixed(2)}` : 'Não definido'}\n`;
+    textoResumo += `${SEPARADOR}\n`;
     textoResumo += `📁 *Limites por Categoria:*\n`;
 
     const categoriasGasto = REGRAS_CATEGORIAS.filter(r => r.tipo === 'gasto').map(r => r.nome).concat(['Despesa']);
@@ -638,6 +686,7 @@ bot.action('menu_limite', async (ctx) => {
       }
     }
     if (!temLimiteCat) textoResumo += `_(Nenhum limite por categoria definido)_\n`;
+    textoResumo += `${SEPARADOR}`;
 
     const menuLimite = Markup.inlineKeyboard([
       [Markup.button.callback('🎯 Definir Limite Geral', 'lim_set_geral')],
@@ -810,9 +859,12 @@ bot.command('limite', async (ctx) => {
   try {
     const chatId = ctx.chat.id;
     const profile = await getUserProfile(chatId);
+    const SEPARADOR = '----------------------------------------';
 
-    let textoResumo = `🎯 *Painel de Limites de Gastos*\n\n`;
-    textoResumo += `• *Limite Geral Mensal:* ${profile.limiteGeral > 0 ? `R$ ${profile.limiteGeral.toFixed(2)}` : 'Não definido'}\n\n`;
+    let textoResumo = `🎯 *PAINEL DE LIMITES DE GASTOS*\n`;
+    textoResumo += `${SEPARADOR}\n`;
+    textoResumo += `• *Limite Geral Mensal:* ${profile.limiteGeral > 0 ? `R$ ${profile.limiteGeral.toFixed(2)}` : 'Não definido'}\n`;
+    textoResumo += `${SEPARADOR}\n`;
     textoResumo += `📁 *Limites por Categoria:*\n`;
 
     const categoriasGasto = REGRAS_CATEGORIAS.filter(r => r.tipo === 'gasto').map(r => r.nome).concat(['Despesa']);
@@ -826,6 +878,7 @@ bot.command('limite', async (ctx) => {
       }
     }
     if (!temLimiteCat) textoResumo += `_(Nenhum limite por categoria definido)_\n`;
+    textoResumo += `${SEPARADOR}`;
 
     const menuLimite = Markup.inlineKeyboard([
       [Markup.button.callback('🎯 Definir Limite Geral', 'lim_set_geral')],
@@ -888,8 +941,10 @@ bot.command('contasfixas', async (ctx) => {
 async function exibirMenuContasFixas(ctx, isEdit = false) {
   const chatId = ctx.chat.id;
   const profile = await getUserProfile(chatId);
+  const SEPARADOR = '----------------------------------------';
 
-  let texto = `📌 *Suas Contas Fixas Mensais:*\n\n`;
+  let texto = `📌 *SUAS CONTAS FIXAS MENSAIS*\n`;
+  texto += `${SEPARADOR}\n`;
   const botoes = [];
 
   if (!profile.contasFixas || profile.contasFixas.length === 0) {
@@ -898,11 +953,12 @@ async function exibirMenuContasFixas(ctx, isEdit = false) {
     let total = 0;
     profile.contasFixas.forEach((c, idx) => {
       total += c.valor;
-      texto += `${idx + 1}. *${c.nome}*: R$ ${c.valor.toFixed(2)} (${c.categoria})\n`;
+      texto += `${idx + 1}. *${c.nome}*: R$ ${c.valor.toFixed(2)} _(${c.categoria})_\n`;
       botoes.push([Markup.button.callback(`⚙️ Gerenciar: ${c.nome}`, `cf_gerenciar_${idx}`)]);
     });
-    texto += `\n💰 *Total de Contas Fixas:* R$ ${total.toFixed(2)}`;
+    texto += `${SEPARADOR}\n💰 *Total de Contas Fixas:* *R$ ${total.toFixed(2)}*\n`;
   }
+  texto += `${SEPARADOR}`;
 
   botoes.push([Markup.button.callback('➕ Adicionar Conta Fixa', 'cf_add')]);
   if (profile.contasFixas && profile.contasFixas.length > 0) {
@@ -1305,12 +1361,15 @@ bot.action('rel_ver_config', async (ctx) => {
       return editMD(ctx, '⚠️ Nenhum relatório configurado ainda.', menuBotoes);
     }
 
+    const SEPARADOR = '----------------------------------------';
     await editMD(
       ctx,
-      `📋 *Sua Configuração de Relatório:*\n\n` +
+      `📋 *SUA CONFIGURAÇÃO DE RELATÓRIO*\n` +
+      `${SEPARADOR}\n` +
       `• Frequência: *${config.frequencia}*\n` +
-      `${config.diaEspecifico ? `• Dia/Opção: *${config.diaEspecifico}*\n` : ''}` +
-      `• Horário: *${config.horario}h*`,
+      `${config.diaEspecifico ? `• Regra / Dia: *${config.diaEspecifico}*\n` : ''}` +
+      `• Horário: *${config.horario}h*\n` +
+      `${SEPARADOR}`,
       menuBotoes
     );
   } catch (err) {
@@ -1588,15 +1647,22 @@ bot.on(['photo', 'document', 'voice', 'audio', 'video'], async (ctx) => {
     const adminGroupId = await getAdminGroupId();
 
     // Atendente respondeu com mídia no grupo
-    if (adminGroupId && chatId === String(adminGroupId)) {
+    if (adminGroupId && isSameChat(chatId, adminGroupId)) {
+      let targetChatId = null;
       if (ctx.message.reply_to_message) {
-        const targetChatId = extrairChatIdDeMensagem(ctx.message.reply_to_message);
-        if (targetChatId) {
-          await ctx.copyMessage(targetChatId).catch(() => {});
-          const targetProfile = await getUserProfile(targetChatId);
-          targetProfile.ultimaAtividade = new Date();
-          await targetProfile.save();
-        }
+        targetChatId = extrairChatIdDeMensagem(ctx.message.reply_to_message);
+      }
+      if (!targetChatId) {
+        const ativos = await User.find({ emAtendimentoHumano: true }).sort({ ultimaAtividade: -1 }).limit(2);
+        if (ativos.length === 1) targetChatId = ativos[0].chatId;
+      }
+
+      if (targetChatId) {
+        await ctx.copyMessage(targetChatId).catch(() => {});
+        const targetProfile = await getUserProfile(targetChatId);
+        targetProfile.ultimaAtividade = new Date();
+        await targetProfile.save();
+        await ctx.reply(`✅ _Mídia entregue ao usuário (ID: \`${targetChatId}\`)_`, { parse_mode: 'Markdown' }).catch(() => {});
       }
       return;
     }
@@ -1630,46 +1696,65 @@ bot.on('text', async (ctx) => {
     const adminGroupId = await getAdminGroupId();
 
     // 1. Mensagem vinda do Grupo de Atendimento (ADMIN_GROUP_ID)
-    if (adminGroupId && chatId === String(adminGroupId)) {
-      // Se for uma resposta (Reply) na mensagem repassada do usuário
+    if (adminGroupId && isSameChat(chatId, adminGroupId)) {
+      let targetChatId = null;
+
+      // 1.1 Se o atendente usou a função "Responder" (Reply)
       if (ctx.message.reply_to_message) {
-        const targetChatId = extrairChatIdDeMensagem(ctx.message.reply_to_message);
-        if (targetChatId) {
-          if (texto.trim().toLowerCase().startsWith('/fechar')) {
-            return fecharAtendimento(ctx, targetChatId, 'admin');
-          }
+        targetChatId = extrairChatIdDeMensagem(ctx.message.reply_to_message);
+      }
 
-          const targetProfile = await getUserProfile(targetChatId);
-          targetProfile.ultimaAtividade = new Date();
-          await targetProfile.save();
-
-          try {
-            await bot.telegram.sendMessage(
-              targetChatId,
-              `👨‍💼 *Atendente:*\n${texto}`,
-              { parse_mode: 'Markdown' }
-            );
-          } catch (errEnvio) {
-            console.error(`Erro ao entregar mensagem do atendente para ${targetChatId}:`, errEnvio.message);
-            await ctx.reply(`⚠️ Não foi possível entregar a mensagem para o usuário (\`${targetChatId}\`). Ele pode ter bloqueado o bot.`, { parse_mode: 'Markdown' }).catch(() => {});
-          }
-          return;
+      // 1.2 Se não usou Reply, verifica se há exatamente 1 usuário ativo no suporte
+      if (!targetChatId && !texto.startsWith('/')) {
+        const ativos = await User.find({ emAtendimentoHumano: true }).sort({ ultimaAtividade: -1 }).limit(2);
+        if (ativos.length === 1) {
+          targetChatId = ativos[0].chatId;
+        } else if (ativos.length > 1) {
+          return ctx.reply('⚠️ Há mais de um atendimento em andamento. Use a opção *Responder (Reply)* na mensagem do usuário para direcionar sua resposta.', { parse_mode: 'Markdown' });
         }
       }
 
-      // Se for /fechar com ID direto no grupo (Ex: /fechar 123456789)
+      // Se identificou o usuário para entrega da mensagem
+      if (targetChatId) {
+        if (texto.trim().toLowerCase().startsWith('/fechar')) {
+          return fecharAtendimento(ctx, targetChatId, 'admin');
+        }
+
+        const targetProfile = await getUserProfile(targetChatId);
+        targetProfile.ultimaAtividade = new Date();
+        await targetProfile.save();
+
+        try {
+          await bot.telegram.sendMessage(
+            targetChatId,
+            `👨‍💼 *Atendente:*\n${texto}`,
+            { parse_mode: 'Markdown' }
+          );
+          await ctx.reply(`✅ _Mensagem entregue ao usuário (ID: \`${targetChatId}\`)_`, { parse_mode: 'Markdown' }).catch(() => {});
+        } catch (errEnvio) {
+          console.error(`Erro ao entregar mensagem do atendente para ${targetChatId}:`, errEnvio.message);
+          await ctx.reply(`⚠️ Não foi possível entregar a mensagem para o usuário (\`${targetChatId}\`). Ele pode ter bloqueado o bot.`, { parse_mode: 'Markdown' }).catch(() => {});
+        }
+        return;
+      }
+
+      // Se for /fechar sem reply (Ex: /fechar 123456789 ou quando há 1 ativo)
       if (texto.trim().toLowerCase().startsWith('/fechar')) {
         const partes = texto.trim().split(/\s+/);
         if (partes.length >= 2) {
-          const targetChatId = partes[1].replace(/\D/g, '');
-          if (targetChatId) {
-            return fecharAtendimento(ctx, targetChatId, 'admin');
+          const directId = partes[1].replace(/\D/g, '');
+          if (directId) {
+            return fecharAtendimento(ctx, directId, 'admin');
           }
+        }
+        const ativos = await User.find({ emAtendimentoHumano: true }).limit(2);
+        if (ativos.length === 1) {
+          return fecharAtendimento(ctx, ativos[0].chatId, 'admin');
         }
         return ctx.reply('⚠️ Para fechar o atendimento, responda à mensagem do usuário com `/fechar` ou digite `/fechar <ID_DO_USUARIO>`.', { parse_mode: 'Markdown' });
       }
 
-      // Outras mensagens normais no grupo de suporte são ignoradas pelo bot
+      // Outras mensagens normais no grupo de suporte sem atendimento ativo são ignoradas pelo bot
       return;
     }
 
